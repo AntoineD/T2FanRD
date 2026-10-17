@@ -22,6 +22,8 @@ pub enum Error {
     MaxSpeedRead(#[source] std::io::Error),
     #[error("Cannot parse maximum fan speed")]
     MaxSpeedParse(#[source] std::num::ParseIntError),
+    #[error("Minimum fan speed ({min}) is above maximum fan speed ({max}); check the fan's min/max or set min_speed/max_speed in config file")]
+    InvalidSpeedRange { min: u32, max: u32 },
 
     #[error("Cannot read pid file")]
     PidRead(#[source] std::io::Error),

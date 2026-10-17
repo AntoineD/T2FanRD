@@ -26,6 +26,8 @@ There's four options for each fan.
 |     high_temp     |         Temperature that will trigger max fan speed         |
 |    speed_curve    |   Three options present. Will be explained in table below.  |
 | always_full_speed | if set "true", the fan will be at max speed no matter what. |
+|     min_speed     |  Optional. Overrides the fan's minimum speed (`fanN_min`).   |
+|     max_speed     |  Optional. Overrides the fan's maximum speed (`fanN_max`). Some SMCs report a lower maximum than the fan runs at. |
 
 For `speed_curve`, there's three options.
 |     Key     |                   Value                   |

@@ -26,17 +26,43 @@ impl FanController {
             path
         }
 
-        let min_speed = std::fs::read_to_string(join_suffix(path.clone(), "_min"))
-            .map_err(Error::MinSpeedRead)?
-            .trim()
-            .parse()
-            .map_err(Error::MinSpeedParse)?;
+        fn read_speed(
+            path: PathBuf,
+            read_err: fn(std::io::Error) -> Error,
+            parse_err: fn(std::num::ParseIntError) -> Error,
+        ) -> Result<u32> {
+            std::fs::read_to_string(path)
+                .map_err(read_err)?
+                .trim()
+                .parse()
+                .map_err(parse_err)
+        }
 
-        let max_speed = std::fs::read_to_string(join_suffix(path.clone(), "_max"))
-            .map_err(Error::MaxSpeedRead)?
-            .trim_end()
-            .parse()
-            .map_err(Error::MaxSpeedParse)?;
+        let min_speed = match config.min_speed {
+            Some(speed) => speed,
+            None => read_speed(
+                join_suffix(path.clone(), "_min"),
+                Error::MinSpeedRead,
+                Error::MinSpeedParse,
+            )?,
+        };
+
+        let max_speed = match config.max_speed {
+            Some(speed) => speed,
+            None => read_speed(
+                join_suffix(path.clone(), "_max"),
+                Error::MaxSpeedRead,
+                Error::MaxSpeedParse,
+            )?,
+        };
+
+        // Equal is fine: the fan just stays at that speed.
+        if min_speed > max_speed {
+            return Err(Error::InvalidSpeedRange {
+                min: min_speed,
+                max: max_speed,
+            });
+        }
 
         let mut open_options = std::fs::OpenOptions::new();
         open_options.write(true).truncate(true);
@@ -67,12 +93,9 @@ impl FanController {
             .map_err(Error::FanWrite)
     }
 
-    pub fn set_speed(&self, mut speed: u32) -> Result<()> {
-        if speed < self.min_speed {
-            speed = self.min_speed;
-        } else if speed > self.max_speed {
-            speed = self.max_speed;
-        }
+    pub fn set_speed(&self, speed: u32) -> Result<()> {
+        // `new` guarantees min <= max, so this can't panic.
+        let speed = speed.clamp(self.min_speed, self.max_speed);
 
         {
             let mut stdout = std::io::stdout().lock();
