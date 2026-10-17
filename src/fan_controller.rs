@@ -1,7 +1,4 @@
-use std::{
-    io::{IsTerminal, Write},
-    path::PathBuf,
-};
+use std::{io::Write, path::PathBuf};
 
 use crate::{
     config::{FanConfig, SpeedCurve},
@@ -83,7 +80,7 @@ impl FanController {
             max_speed,
         };
 
-        println!("Found fan: {this:#?}");
+        log!("Found fan: {this:#?}");
         Ok(this)
     }
 
@@ -97,13 +94,7 @@ impl FanController {
         // `new` guarantees min <= max, so this can't panic.
         let speed = speed.clamp(self.min_speed, self.max_speed);
 
-        {
-            let mut stdout = std::io::stdout().lock();
-            if stdout.is_terminal() {
-                print!("\x1b[1K\rSetting fan speed to {speed}");
-                let _ = stdout.flush();
-            }
-        }
+        crate::tty::status(format_args!("Setting fan speed to {speed}"));
 
         write!(&self.output_file, "{speed}").map_err(Error::FanWrite)?;
         Ok(())

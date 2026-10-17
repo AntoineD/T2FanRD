@@ -1,0 +1,8 @@
+# Messages must go through log!/elog!, which erase the fan speed status line
+# first; a bare println! would be appended to it.
+disallowed-macros = [
+    { path = "std::println", reason = "use log!, which erases the fan speed status line first" },
+    { path = "std::eprintln", reason = "use elog!, which erases the fan speed status line first" },
+    { path = "std::print", reason = "use tty::status or log!" },
+    { path = "std::eprint", reason = "use elog!" },
+]

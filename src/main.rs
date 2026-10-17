@@ -14,6 +14,7 @@ use std::{
     path::PathBuf,
     process::ExitCode,
     sync::{atomic::AtomicBool, Arc},
+    time::{Duration, Instant},
 };
 
 use arraydeque::ArrayDeque;
@@ -24,9 +25,27 @@ use signal_hook::consts::{SIGINT, SIGTERM};
 use config::load_fan_configs;
 use error::{Error, Result};
 
+/// `println!`, after erasing the fan speed status line.
+macro_rules! log {
+    () => {
+        $crate::tty::log(format_args!(""))
+    };
+    ($($arg:tt)*) => {
+        $crate::tty::log(format_args!($($arg)*))
+    };
+}
+
+/// `eprintln!`, after erasing the fan speed status line.
+macro_rules! elog {
+    ($($arg:tt)*) => {
+        $crate::tty::elog(format_args!($($arg)*))
+    };
+}
+
 mod config;
 mod error;
 mod fan_controller;
+mod tty;
 
 #[cfg(not(target_os = "linux"))]
 compile_error!("This tool is only developed for Linux systems.");
@@ -86,31 +105,34 @@ fn check_pid_file() -> Result<()> {
 }
 
 fn read_temp_file(temp_file: &mut std::fs::File, temp_buf: &mut String) -> Result<u8> {
+    temp_buf.clear();
     temp_file
         .read_to_string(temp_buf)
         .map_err(Error::TempRead)?;
 
     temp_file.rewind().map_err(Error::TempSeek)?;
 
-    let temp = temp_buf.trim_end().parse::<u32>().map_err(Error::TempParse);
-    temp_buf.clear();
-    temp.map(|t| (t / 1000) as u8)
+    let temp = temp_buf
+        .trim_end()
+        .parse::<u32>()
+        .map_err(Error::TempParse)?;
+    Ok((temp / 1000) as u8)
 }
 
-fn find_temp_file(temps: glob::Paths, temp_buf: &mut String) -> Option<std::fs::File> {
+fn find_temp_file(temps: glob::Paths, temp_buf: &mut String) -> Option<(PathBuf, std::fs::File)> {
     for temp_path_res in temps {
         let Ok(temp_path) = temp_path_res else {
-            eprintln!("Unable to read glob path");
+            elog!("Unable to read glob path");
             continue;
         };
 
-        let Ok(mut temp_file) = std::fs::File::open(temp_path) else {
-            eprintln!("Unable to open temperature sensor");
+        let Ok(mut temp_file) = std::fs::File::open(&temp_path) else {
+            elog!("Unable to open temperature sensor");
             continue;
         };
 
         if read_temp_file(&mut temp_file, temp_buf).is_ok() {
-            return Some(temp_file);
+            return Some((temp_path, temp_file));
         }
     }
 
@@ -119,19 +141,76 @@ fn find_temp_file(temps: glob::Paths, temp_buf: &mut String) -> Option<std::fs::
 
 fn find_cpu_temp_file(temp_buf: &mut String) -> Result<std::fs::File> {
     let temps = glob::glob("/sys/devices/platform/coretemp.0/hwmon/hwmon*/temp1_input")?;
-    find_temp_file(temps, temp_buf).ok_or(Error::NoCpu)
+    let (_, file) = find_temp_file(temps, temp_buf).ok_or(Error::NoCpu)?;
+    Ok(file)
 }
 
+/// How often to look for a GPU temperature sensor while there is none.
+const GPU_RESCAN: Duration = Duration::from_secs(10);
+
+/// The temperature sensor of the first DRM card that has one.  Any card, not
+/// only card0: card0 can be a firmware framebuffer (simpledrm) that the GPU
+/// driver replaces, leaving the GPU on card1.
 fn find_gpu_temp_file(temp_buf: &mut String) -> Result<Option<std::fs::File>> {
-    let temps = glob::glob("/sys/class/drm/card0/device/hwmon/hwmon*/temp1_input")?;
-    Ok(find_temp_file(temps, temp_buf))
+    let temps = glob::glob("/sys/class/drm/card*/device/hwmon/hwmon*/temp1_input")?;
+    Ok(find_temp_file(temps, temp_buf).map(|(path, file)| {
+        log!("Found GPU temperature sensor: {}", path.display());
+        file
+    }))
+}
+
+/// The GPU temperature sensor, which can come and go.  The GPU driver may load
+/// after the daemon starts, and a GPU that is removed or reset (PCI
+/// remove/rescan) invalidates the open handle.  Neither should leave the GPU
+/// out of the curve, or stop the daemon: while there is no sensor, look again
+/// every `GPU_RESCAN`.
+struct GpuSensor {
+    file: Option<std::fs::File>,
+    last_scan: Instant,
+}
+
+impl GpuSensor {
+    fn find(temp_buf: &mut String) -> Result<Self> {
+        let file = find_gpu_temp_file(temp_buf)?;
+        if file.is_none() {
+            log!(
+                "No GPU temperature sensor yet; looking again every {}s",
+                GPU_RESCAN.as_secs()
+            );
+        }
+        Ok(Self {
+            file,
+            last_scan: Instant::now(),
+        })
+    }
+
+    /// The GPU temperature, or `None` while there is no sensor.
+    fn read(&mut self, temp_buf: &mut String) -> Result<Option<u8>> {
+        if self.file.is_none() && self.last_scan.elapsed() >= GPU_RESCAN {
+            self.file = find_gpu_temp_file(temp_buf)?;
+            self.last_scan = Instant::now();
+        }
+
+        let Some(file) = &mut self.file else {
+            return Ok(None);
+        };
+        match read_temp_file(file, temp_buf) {
+            Ok(temp) => Ok(Some(temp)),
+            Err(err) => {
+                elog!("GPU temperature sensor lost ({err}); looking for it again");
+                self.file = None;
+                self.last_scan = Instant::now();
+                Ok(None)
+            }
+        }
+    }
 }
 
 fn main() -> ExitCode {
     match real_main() {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
-            eprintln!("Error: {err}");
+            elog!("Error: {err}");
             ExitCode::FAILURE
         }
     }
@@ -140,7 +219,7 @@ fn main() -> ExitCode {
 fn start_temp_loop(
     mut temp_buffer: String,
     mut cpu_temp_file: std::fs::File,
-    mut gpu_temp_file: Option<std::fs::File>,
+    mut gpu_sensor: GpuSensor,
     fans: &NonEmptyVec<FanController>,
 ) -> Result<()> {
     let cancellation_token = Arc::new(AtomicBool::new(false));
@@ -151,17 +230,10 @@ fn start_temp_loop(
     let mut temps = ArrayDeque::<u8, 50, arraydeque::Wrapping>::new();
     let mut was_long_sleep = false;
     while !cancellation_token.load(std::sync::atomic::Ordering::Relaxed) {
-        let cpu_temp = read_temp_file(&mut cpu_temp_file, &mut temp_buffer)?;
-        let temp = if let Some(gpu_temp_file) = &mut gpu_temp_file {
-            let gpu_temp = read_temp_file(gpu_temp_file, &mut temp_buffer)?;
-            if gpu_temp > cpu_temp {
-                gpu_temp
-            } else {
-                cpu_temp
-            }
-        } else {
-            cpu_temp
-        };
+        let mut temp = read_temp_file(&mut cpu_temp_file, &mut temp_buffer)?;
+        if let Some(gpu_temp) = gpu_sensor.read(&mut temp_buffer)? {
+            temp = temp.max(gpu_temp);
+        }
 
         temps.push_back(temp);
         if was_long_sleep {
@@ -202,15 +274,15 @@ fn real_main() -> Result<()> {
     let fan_paths = find_fan_paths()?;
     let fans = load_fan_configs(fan_paths)?;
     let cpu_temp_file = find_cpu_temp_file(&mut temp_buffer)?;
-    let gpu_temp_file = find_gpu_temp_file(&mut temp_buffer)?;
+    let gpu_sensor = GpuSensor::find(&mut temp_buffer)?;
 
-    println!();
+    log!();
     for fan in &fans {
         fan.set_manual(true)?;
     }
 
-    let res = start_temp_loop(temp_buffer, cpu_temp_file, gpu_temp_file, &fans);
-    println!("T2 Fan Daemon is shutting down...");
+    let res = start_temp_loop(temp_buffer, cpu_temp_file, gpu_sensor, &fans);
+    log!("T2 Fan Daemon is shutting down...");
     for fan in fans {
         fan.set_manual(false)?;
     }
